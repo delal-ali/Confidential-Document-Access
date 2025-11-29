@@ -1,0 +1,291 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// User Model
+model User {
+  id                      String    @id @default(cuid())
+  email                   String    @unique
+  phone                   String?
+  username                String    @unique
+  passwordHash            String
+  emailVerified           Boolean   @default(false)
+  phoneVerified           Boolean   @default(false)
+  emailVerificationToken  String?
+  phoneVerificationToken  String?
+  emailVerificationExpiry DateTime?
+  phoneVerificationExpiry DateTime?
+  passwordResetToken      String?
+  passwordResetExpiry     DateTime?
+
+  // Security labels for MAC
+  securityLabel  String @default("PUBLIC") // PUBLIC, INTERNAL, CONFIDENTIAL, TOP_SECRET
+  clearanceLevel Int    @default(0) // 0=Public, 1=Internal, 2=Confidential
+
+  // Profile information
+  firstName        String?
+  lastName         String?
+  department       String?
+  location         String?
+  employmentStatus String  @default("ACTIVE") // ACTIVE, INACTIVE, SUSPENDED, TERMINATED
+
+  // Authentication
+  mfaEnabled          Boolean   @default(false)
+  mfaSecret           String?
+  failedLoginAttempts Int       @default(0)
+  accountLocked       Boolean   @default(false)
+  accountLockedUntil  DateTime?
+  lastLogin           DateTime?
+  lastPasswordChange  DateTime  @default(now())
+
+  // Relationships
+  roles               UserRole[]
+  ownedDocuments      Document[]           @relation("DocumentOwner")
+  documentPermissions DocumentPermission[]
+  sessions            Session[]
+  auditLogs           AuditLog[]
+  accessRules         AccessRule[]
+  roleRequests        RoleRequest[]        @relation("RequestedBy")
+  reviewedRequests    RoleRequest[]        @relation("ReviewedBy")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Role Model for RBAC
+model Role {
+  id           String           @id @default(cuid())
+  name         String           @unique
+  description  String?
+  permissions  RolePermission[]
+  users        UserRole[]
+  roleRequests RoleRequest[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+}
+
+// Permission Model
+model Permission {
+  id              String           @id @default(cuid())
+  name            String           @unique
+  description     String?
+  resource        String // e.g., "document", "user", "system"
+  action          String // e.g., "read", "write", "delete", "approve"
+  rolePermissions RolePermission[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+}
+
+// Role-Permission mapping
+model RolePermission {
+  id           String     @id @default(cuid())
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([roleId, permissionId])
+}
+
+// User-Role mapping
+model UserRole {
+  id         String    @id @default(cuid())
+  userId     String
+  roleId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role       Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  assignedBy String? // User ID who assigned this role
+  assignedAt DateTime  @default(now())
+  expiresAt  DateTime?
+  isActive   Boolean   @default(true)
+
+  @@unique([userId, roleId])
+}
+
+// Document Model
+model Document {
+  id       String  @id @default(cuid())
+  title    String
+  content  String? // Encrypted content
+  fileName String?
+  filePath String?
+  fileSize Int?
+  mimeType String?
+
+  // MAC - Security classification
+  securityLabel  String @default("PUBLIC") // PUBLIC, INTERNAL, CONFIDENTIAL, TOP_SECRET
+  classification String @default("PUBLIC") // PUBLIC, INTERNAL, CONFIDENTIAL
+
+  // DAC - Ownership
+  ownerId String
+  owner   User   @relation("DocumentOwner", fields: [ownerId], references: [id])
+  
+  // ABAC - Department and metadata for fine-grained access control
+  department String? // Department this document belongs to (e.g., "Payroll", "IT", "HR")
+
+  // Permissions
+  permissions DocumentPermission[]
+  accessRules DocumentAccessRule[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Document Permission (DAC)
+model DocumentPermission {
+  id         String   @id @default(cuid())
+  documentId String
+  userId     String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  canRead   Boolean @default(false)
+  canWrite  Boolean @default(false)
+  canDelete Boolean @default(false)
+  canShare  Boolean @default(false)
+
+  grantedBy String? // User ID who granted permission
+  grantedAt DateTime  @default(now())
+  expiresAt DateTime?
+  isActive  Boolean   @default(true)
+
+  @@unique([documentId, userId])
+}
+
+// Access Rules (RuBAC/ABAC)
+model AccessRule {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  ruleType    String  @default("TIME") // TIME, LOCATION, DEVICE, ATTRIBUTE, COMPOSITE
+
+  // Time-based rules
+  allowedStartTime String? // HH:mm format
+  allowedEndTime   String?
+  allowedDays      String? // Comma-separated: MON,TUE,WED
+
+  // Location-based rules
+  allowedLocations String? // Comma-separated IPs or location names
+
+  // Device-based rules
+  allowedDevices String? // Comma-separated device types
+
+  // Attribute-based conditions (JSON)
+  attributeConditions String? // JSON string with conditions
+
+  // Target
+  targetType String // "document", "role", "permission"
+  targetId   String?
+
+  // Applied to
+  userId        String?
+  user          User?                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documentRules DocumentAccessRule[]
+
+  isActive Boolean @default(true)
+  priority Int     @default(0) // Higher priority rules evaluated first
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Document-specific access rules
+model DocumentAccessRule {
+  id         String     @id @default(cuid())
+  documentId String
+  document   Document   @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  ruleId     String
+  rule       AccessRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([documentId, ruleId])
+}
+
+// Audit Log
+model AuditLog {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action       String // e.g., "LOGIN", "DOCUMENT_ACCESS", "PERMISSION_GRANTED"
+  resourceType String? // e.g., "document", "user", "role"
+  resourceId   String?
+
+  ipAddress  String?
+  userAgent  String?
+  location   String?
+  deviceType String?
+
+  // Encrypted details (JSON)
+  details String? // Encrypted JSON with additional details
+
+  // Status
+  status       String  @default("SUCCESS") // SUCCESS, FAILURE, WARNING
+  errorMessage String?
+
+  timestamp DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([timestamp])
+}
+
+// Session Model
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token        String   @unique
+  refreshToken String?  @unique
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([token])
+}
+
+// Backup Record
+model Backup {
+  id           String   @id @default(cuid())
+  fileName     String
+  filePath     String
+  backupType   String   @default("FULL") // FULL, INCREMENTAL, DIFFERENTIAL
+  size         Int
+  status       String   @default("SUCCESS") // SUCCESS, FAILED, IN_PROGRESS
+  errorMessage String?
+  createdAt    DateTime @default(now())
+}
+
+// Role Change Request
+model RoleRequest {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation("RequestedBy", fields: [userId], references: [id], onDelete: Cascade)
+  requestedRoleId String
+  requestedRole   Role      @relation(fields: [requestedRoleId], references: [id], onDelete: Cascade)
+  reason          String? // Optional reason for the request
+  status          String    @default("PENDING") // PENDING, APPROVED, DENIED, CANCELLED
+  reviewedBy      String? // User ID who reviewed the request
+  reviewer        User?     @relation("ReviewedBy", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  reviewNotes     String? // Notes from the reviewer
+  createdAt       DateTime  @default(now())
+  reviewedAt      DateTime?
+  updatedAt       DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}

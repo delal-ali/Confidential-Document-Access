@@ -1,0 +1,7 @@
+{
+  "buildCommand": "npm install --include=dev && prisma generate && npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install --include=dev",
+  "framework": "nextjs"
+}
+
