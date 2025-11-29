@@ -202,17 +202,45 @@ export async function GET(request: NextRequest) {
       
       // Step 2: After MAC passes, check DAC (permissions) and role-based access
       // Employees can access:
-      // 1. PUBLIC documents (system-granted, MAC passed)
-      // 2. Documents they have explicit permission for (if MAC allows)
+      // 1. PUBLIC documents (system-granted, MAC passed) - ALWAYS allowed
+      // 2. Documents they own
+      // 3. Documents they have explicit permission for (if MAC allows)
       if (isEmployee) {
         const isPublic = doc.securityLabel === 'PUBLIC' && doc.classification === 'PUBLIC'
-        // Check if employee has explicit permission (already in whereConditions)
-        const hasExplicitPermission = documents.some(d => 
-          d.id === doc.id && 
-          (d.ownerId === user.id || 
-           (doc.permissions && doc.permissions.some((p: any) => p.userId === user.id && p.canRead && p.isActive)))
-        )
-        return isPublic || hasExplicitPermission
+        if (isPublic) {
+          // PUBLIC documents are always accessible to employees (after MAC passes)
+          console.log('✅ Employee accessing PUBLIC document - access granted:', {
+            documentId: doc.id,
+            documentTitle: doc.title,
+            securityLabel: doc.securityLabel,
+            classification: doc.classification,
+          })
+          return true
+        }
+        
+        // For non-PUBLIC documents, check ownership or explicit permission
+        const isOwner = doc.ownerId === user.id
+        // Permissions array is already filtered to only include this user's permissions
+        const hasExplicitPermission = doc.permissions && doc.permissions.length > 0 && 
+          doc.permissions.some((p: any) => p.canRead === true)
+        
+        if (isOwner || hasExplicitPermission) {
+          console.log('✅ Employee accessing document with permission:', {
+            documentId: doc.id,
+            isOwner,
+            hasExplicitPermission,
+          })
+          return true
+        }
+        
+        console.log('❌ Employee cannot access document:', {
+          documentId: doc.id,
+          isPublic,
+          isOwner,
+          hasExplicitPermission,
+          permissionsCount: doc.permissions?.length || 0,
+        })
+        return false
       }
       
       // For managers and others: MAC passed, check ownership/permissions

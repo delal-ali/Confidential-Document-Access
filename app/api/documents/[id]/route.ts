@@ -107,6 +107,32 @@ export async function GET(
     // System-determined access policies take precedence over user discretion
     // DAC permissions only work if MAC clearance allows access
     
+    // Determine if document is PUBLIC (needed for access method logging)
+    const isPublicDocument = document.securityLabel === 'PUBLIC' && document.classification === 'PUBLIC'
+    
+    // Check if document owner is an employee (for managers to access employee documents)
+    let ownerIsEmployee = false
+    if (isManager && !isOwner && !hasPermission) {
+      const ownerRoles = await prisma.userRole.findMany({
+        where: {
+          userId: document.ownerId,
+          isActive: true,
+          OR: [
+            { expiresAt: null },
+            { expiresAt: { gt: new Date() } },
+          ],
+        },
+        include: {
+          role: true,
+        },
+      })
+      ownerIsEmployee = ownerRoles.some(ur => ur.role.name === 'Employee')
+    }
+    
+    // Determine access permissions (needed for RuBAC/ABAC bypass logic)
+    const canAccessAsEmployee = isEmployee && (isPublicDocument || isOwner || hasPermission)
+    const canAccessAsManager = isManager && (isOwner || hasPermission || ownerIsEmployee)
+    
     // Administrators bypass all checks - they can access any document
     if (isAdmin) {
       console.log('✅ Admin accessing document - bypassing all checks (system administrator privilege)')
@@ -157,43 +183,15 @@ export async function GET(
       console.log('✅ MAC check passed - proceeding with additional access checks')
       
       // After MAC passes, check DAC (ownership/permissions) and role-based access
-      const isPublicDocument = document.securityLabel === 'PUBLIC' && document.classification === 'PUBLIC'
-      
-      // Employees can access:
-      // 1. PUBLIC documents (system-granted, MAC already passed)
-      // 2. Documents they have explicit permission for (if MAC allows)
-      const canAccessAsEmployee = isEmployee && (isPublicDocument || hasPermission)
-      
-      // Check if document owner is an employee (for managers to access employee documents)
-      let ownerIsEmployee = false
-      if (isManager && !isOwner && !hasPermission) {
-        const ownerRoles = await prisma.userRole.findMany({
-          where: {
-            userId: document.ownerId,
-            isActive: true,
-            OR: [
-              { expiresAt: null },
-              { expiresAt: { gt: new Date() } },
-            ],
-          },
-          include: {
-            role: true,
-          },
-        })
-        ownerIsEmployee = ownerRoles.some(ur => ur.role.name === 'Employee')
-      }
-      
-      // Managers can access:
-      // 1. Documents they own (if MAC allows)
-      // 2. Documents they have permission for (if MAC allows)
-      // 3. Documents created by employees (if MAC allows)
-      const canAccessAsManager = isManager && (isOwner || hasPermission || ownerIsEmployee)
       
       // Check DAC access (only if MAC passed)
       if (isEmployee && !canAccessAsEmployee) {
         console.log('❌ Access denied - Employee DAC check failed (MAC passed but no permission):', {
           isPublicDocument,
+          isOwner,
           hasPermission,
+          documentSecurityLabel: document.securityLabel,
+          documentClassification: document.classification,
         })
         await createAuditLog({
           userId: user.id,
@@ -202,17 +200,23 @@ export async function GET(
           resourceId: document.id,
           ipAddress: request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || undefined,
           details: {
-            reason: 'Employee can only access PUBLIC documents or documents with explicit permission (MAC passed)',
+            reason: 'Employee can only access PUBLIC documents, documents they own, or documents with explicit permission (MAC passed)',
             macPassed: true,
+            isOwner,
             hasPermission,
             isPublicDocument,
+            documentSecurityLabel: document.securityLabel,
+            documentClassification: document.classification,
           },
         })
         
         return NextResponse.json(
           { 
-            error: 'Access denied: Employees can only access PUBLIC documents or documents they have been granted permission for. MAC clearance passed, but no permission granted.',
+            error: 'Access denied: Employees can only access PUBLIC documents, documents they own, or documents they have been granted permission for. MAC clearance passed, but no permission granted.',
             systemPolicy: 'MAC + DAC enforcement',
+            documentSecurityLabel: document.securityLabel,
+            documentClassification: document.classification,
+            isPublicDocument,
           },
           { status: 403 }
         )
