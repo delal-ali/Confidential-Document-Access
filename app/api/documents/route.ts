@@ -67,9 +67,24 @@ export async function GET(request: NextRequest) {
       },
     })
     
+    console.log('🔍 User roles for document listing:', {
+      userId: user.id,
+      username: user.username,
+      userRolesCount: userRoles.length,
+      userRoles: userRoles.map(ur => ({ roleName: ur.role.name, isActive: ur.isActive })),
+    })
+    
     const isAdmin = userRoles.some(ur => ur.role.name === 'Administrator')
     const isManager = userRoles.some(ur => ur.role.name === 'Manager')
     const isEmployee = userRoles.some(ur => ur.role.name === 'Employee')
+    
+    // If user has no roles, log a warning but continue (they'll only see their own documents)
+    if (userRoles.length === 0) {
+      console.warn('⚠️ User has no active roles assigned:', {
+        userId: user.id,
+        username: user.username,
+      })
+    }
     
     // Administrators can see ALL documents
     if (isAdmin) {
@@ -115,32 +130,37 @@ export async function GET(request: NextRequest) {
     
     // Managers can see documents created by employees
     if (isManager) {
-      // Get all employee user IDs
-      const employeeRole = await prisma.role.findUnique({
-        where: { name: 'Employee' },
-        include: {
-          userRoles: {
-            where: {
-              isActive: true,
-              OR: [
-                { expiresAt: null },
-                { expiresAt: { gt: new Date() } },
-              ],
+      try {
+        // Get all employee user IDs
+        const employeeRole = await prisma.role.findUnique({
+          where: { name: 'Employee' },
+          include: {
+            userRoles: {
+              where: {
+                isActive: true,
+                OR: [
+                  { expiresAt: null },
+                  { expiresAt: { gt: new Date() } },
+                ],
+              },
+              select: {
+                userId: true,
+              },
             },
-            select: {
-              userId: true,
-            },
-          },
-        },
-      })
-      
-      if (employeeRole && employeeRole.userRoles.length > 0) {
-        const employeeUserIds = employeeRole.userRoles.map(ur => ur.userId)
-        whereConditions.push({
-          ownerId: {
-            in: employeeUserIds,
           },
         })
+        
+        if (employeeRole && employeeRole.userRoles && employeeRole.userRoles.length > 0) {
+          const employeeUserIds = employeeRole.userRoles.map(ur => ur.userId)
+          whereConditions.push({
+            ownerId: {
+              in: employeeUserIds,
+            },
+          })
+        }
+      } catch (error) {
+        console.error('Error fetching employee role:', error)
+        // Continue without employee documents filter if there's an error
       }
     }
     
@@ -187,66 +207,81 @@ export async function GET(request: NextRequest) {
     // System-determined access policies take precedence over user discretion
     // DAC permissions only work if MAC clearance allows access
     const accessibleDocuments = documents.filter(doc => {
-      // Step 1: MANDATORY MAC check - system-determined access policy
-      const macAllowed = checkMACAccess(
-        user.securityLabel as 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'TOP_SECRET',
-        user.clearanceLevel,
-        doc.securityLabel as 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'TOP_SECRET',
-        doc.classification as 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL'
-      )
-      
-      // If MAC fails, access is denied regardless of permissions
-      if (!macAllowed) {
-        return false
-      }
-      
-      // Step 2: After MAC passes, check DAC (permissions) and role-based access
-      // Employees can access:
-      // 1. PUBLIC documents (system-granted, MAC passed) - ALWAYS allowed
-      // 2. Documents they own
-      // 3. Documents they have explicit permission for (if MAC allows)
-      if (isEmployee) {
-        const isPublic = doc.securityLabel === 'PUBLIC' && doc.classification === 'PUBLIC'
-        if (isPublic) {
-          // PUBLIC documents are always accessible to employees (after MAC passes)
-          console.log('✅ Employee accessing PUBLIC document - access granted:', {
-            documentId: doc.id,
-            documentTitle: doc.title,
-            securityLabel: doc.securityLabel,
-            classification: doc.classification,
-          })
-          return true
+      try {
+        // Ensure user has valid security label and clearance level (default to PUBLIC if missing)
+        const userSecurityLabel = (user.securityLabel || 'PUBLIC') as 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'TOP_SECRET'
+        const userClearanceLevel = user.clearanceLevel ?? 0
+        const docSecurityLabel = (doc.securityLabel || 'PUBLIC') as 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL' | 'TOP_SECRET'
+        const docClassification = (doc.classification || 'PUBLIC') as 'PUBLIC' | 'INTERNAL' | 'CONFIDENTIAL'
+        
+        // Step 1: MANDATORY MAC check - system-determined access policy
+        const macAllowed = checkMACAccess(
+          userSecurityLabel,
+          userClearanceLevel,
+          docSecurityLabel,
+          docClassification
+        )
+        
+        // If MAC fails, access is denied regardless of permissions
+        if (!macAllowed) {
+          return false
         }
         
-        // For non-PUBLIC documents, check ownership or explicit permission
-        const isOwner = doc.ownerId === user.id
-        // Permissions array is already filtered to only include this user's permissions
-        const hasExplicitPermission = doc.permissions && doc.permissions.length > 0 && 
-          doc.permissions.some((p: any) => p.canRead === true)
-        
-        if (isOwner || hasExplicitPermission) {
-          console.log('✅ Employee accessing document with permission:', {
+        // Step 2: After MAC passes, check DAC (permissions) and role-based access
+        // Employees can access:
+        // 1. PUBLIC documents (system-granted, MAC passed) - ALWAYS allowed
+        // 2. Documents they own
+        // 3. Documents they have explicit permission for (if MAC allows)
+        if (isEmployee) {
+          const isPublic = doc.securityLabel === 'PUBLIC' && doc.classification === 'PUBLIC'
+          if (isPublic) {
+            // PUBLIC documents are always accessible to employees (after MAC passes)
+            console.log('✅ Employee accessing PUBLIC document - access granted:', {
+              documentId: doc.id,
+              documentTitle: doc.title,
+              securityLabel: doc.securityLabel,
+              classification: doc.classification,
+            })
+            return true
+          }
+          
+          // For non-PUBLIC documents, check ownership or explicit permission
+          const isOwner = doc.ownerId === user.id
+          // Permissions array is already filtered to only include this user's permissions
+          const hasExplicitPermission = doc.permissions && Array.isArray(doc.permissions) && doc.permissions.length > 0 && 
+            doc.permissions.some((p: any) => p && p.canRead === true)
+          
+          if (isOwner || hasExplicitPermission) {
+            console.log('✅ Employee accessing document with permission:', {
+              documentId: doc.id,
+              isOwner,
+              hasExplicitPermission,
+            })
+            return true
+          }
+          
+          console.log('❌ Employee cannot access document:', {
             documentId: doc.id,
+            isPublic,
             isOwner,
             hasExplicitPermission,
+            permissionsCount: doc.permissions?.length || 0,
           })
-          return true
+          return false
         }
         
-        console.log('❌ Employee cannot access document:', {
+        // For managers and others: MAC passed, check ownership/permissions
+        // Documents in the list already passed ownership/permission filters (whereConditions)
+        // So if MAC passed, access is granted
+        return true
+      } catch (error) {
+        console.error('Error filtering document:', error, {
           documentId: doc.id,
-          isPublic,
-          isOwner,
-          hasExplicitPermission,
-          permissionsCount: doc.permissions?.length || 0,
+          documentTitle: doc.title,
         })
+        // On error, deny access for safety
         return false
       }
-      
-      // For managers and others: MAC passed, check ownership/permissions
-      // Documents in the list already passed ownership/permission filters (whereConditions)
-      // So if MAC passed, access is granted
-      return true
     })
     
     await createAuditLog({
@@ -260,8 +295,20 @@ export async function GET(request: NextRequest) {
       documents: accessibleDocuments,
     })
   } catch (error: any) {
+    console.error('Error fetching documents:', error)
+    console.error('Error stack:', error.stack)
+    console.error('Error details:', {
+      message: error.message,
+      name: error.name,
+      code: error.code,
+    })
+    
     return NextResponse.json(
-      { error: 'Failed to fetch documents', message: error.message },
+      { 
+        error: 'Failed to fetch documents', 
+        message: error.message || 'Unknown error occurred',
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      },
       { status: 500 }
     )
   }
